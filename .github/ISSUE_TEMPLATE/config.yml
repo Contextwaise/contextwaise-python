@@ -1,0 +1,11 @@
+blank_issues_enabled: false
+contact_links:
+  - name: Documentation
+    url: https://contextwaise.com/docs/sdk
+    about: Setup, options and adapters.
+  - name: Account, billing or API key help
+    url: mailto:support@contextwaise.com
+    about: For anything about your Contextwaise account, email support.
+  - name: Report a security issue
+    url: https://github.com/Contextwaise/contextwaise-python/security/advisories/new
+    about: Report vulnerabilities privately, never in a public issue.
