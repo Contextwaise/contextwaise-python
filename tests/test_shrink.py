@@ -239,3 +239,96 @@ def test_the_note_counts_the_omitted_log_lines_by_level(api: ApiStub) -> None:
     assert result.mode == "trimmed"
     assert "INV-77" in result.text
     assert re.search(r"Omitted: \d+ lines, INFO ×\d+\.", result.text)
+
+
+def _orders(n: int, **extra: object) -> list[dict[str, object]]:
+    return [
+        {
+            "id": f"ORD-{1000 + i}",
+            "customer": f"Customer {i}",
+            "items": [{"sku": f"SKU-{i}-{j}", "name": f"Product {j} with a long name"} for j in range(4)],
+            **{k: v(i) if callable(v) else v for k, v in extra.items()},
+        }
+        for i in range(n)
+    ]
+
+
+def test_any_tool_output_reaches_the_model(api: ApiStub) -> None:
+    circular: dict[str, object] = {}
+    circular["self"] = circular
+    with connected() as cw:
+        for i, output in enumerate([None, circular]):
+            assert cw.shrink(call_id=f"odd{i}", tool="t", output=output).mode == "full"
+
+
+def test_data_in_a_format_that_is_not_plain_json_is_still_cut(api: ApiStub) -> None:
+    data = json.dumps({"orders": _orders(80)})
+    outputs = {
+        "fenced": f"```json\n{data}\n```",
+        "introduced": f"Found 80 orders:\n{data}",
+        "one_line": " ".join(f"{o['id']} for {o['customer']}." for o in _orders(300)),
+        "xml_one_line": "<orders>"
+        + "".join(f'<order id="{o["id"]}"><c>{o["customer"]}</c></order>' for o in _orders(200))
+        + "</orders>",
+    }
+    with connected(max_tokens=300) as cw:
+        for name, output in outputs.items():
+            view = cw.shrink(call_id=name, tool="lookup", args={"id": "ORD-1042"}, output=output)
+            assert view.mode == "trimmed", name
+            assert "ORD-1042" in view.text, name
+
+
+def test_json_items_mentioning_a_failure_are_data_not_errors(api: ApiStub) -> None:
+    output = _orders(80, payment=lambda i: "failed" if i % 2 else "ok")
+    with connected(max_tokens=300) as cw:
+        view = cw.shrink(call_id="pay", tool="lookup", args={"id": "ORD-1042"}, output=output)
+    assert view.mode == "trimmed"
+    assert "ORD-1042" in view.text
+
+
+def test_a_call_marked_full_passes_whole_and_the_model_id_is_reported(api: ApiStub) -> None:
+    with connected(max_tokens=60) as cw:
+        view = cw.shrink(
+            call_id="f1", tool="list_files", output=LISTING, full=True, model="claude-sonnet-4-5"
+        )
+        cw.flush()
+    assert view.mode == "full"
+    assert api.score_bodies == []
+    assert api.report_bodies[0]["results"][0]["model"] == "claude-sonnet-4-5"
+
+
+def test_a_cut_must_save_more_in_a_long_conversation(api: ApiStub) -> None:
+    output = _orders(40)
+    with connected(max_tokens=300) as cw:
+        cw.note_intent("short", "Find ORD-1012", context_tokens=2_000)
+        cw.note_intent("long", "Find ORD-1012", context_tokens=60_000)
+        assert cw.shrink(call_id="short", tool="lookup", output=output).mode == "trimmed"
+        assert cw.shrink(call_id="long", tool="lookup", output=output).mode != "trimmed"
+
+
+def test_a_view_that_would_keep_nothing_is_not_sent(api: ApiStub) -> None:
+    blob = "zzzz " * 4000
+    with connected(max_tokens=200) as cw:
+        view = cw.shrink(call_id="blob", tool="dump", args={"q": "invoices"}, output=blob)
+    assert view.mode != "trimmed"
+
+
+def test_asked_again_expand_returns_parts_not_shown_yet_then_says_so(api: ApiStub) -> None:
+    rows = "\n".join(f"row {i} carrier {'Hermes' if i % 50 == 7 else 'DHL'} " + "x" * 40 for i in range(400))
+    with connected(max_tokens=200) as cw:
+        cw.note_intent("e1", "Which rows ship with Hermes?")
+        view = cw.shrink(call_id="e1", tool="rows", output=rows)
+        answers = [cw.expand(view.ref, "Hermes") for _ in range(4)]
+    assert view.mode == "trimmed"
+    assert answers[0] != answers[1] or "Nothing more" in answers[1]
+    assert "Nothing more" in answers[-1]
+
+
+def test_a_request_the_api_rejects_does_not_pause_scoring(api: ApiStub) -> None:
+    with connected(max_tokens=60) as cw:
+        cw.note_intent("big", "src/feature42")
+        api.reject_next = True
+        first = cw.shrink(call_id="big", tool="list_files", output=LISTING)
+        second = cw.shrink(call_id="next", tool="list_files", args={"q": "feature42"}, output=LISTING)
+    assert first.scorer == "none"
+    assert second.scorer == "jev", "the next result is scored"

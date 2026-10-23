@@ -6,7 +6,7 @@ usage reports for the dashboard. Neither may ever slow down or break the agent:
 - scoring has a short timeout; after a failure the API is skipped for a while and the
   model gets the cleaned output whole instead (nothing cut);
 - reports are batched, sent from a background thread, and dropped if they can't be
-  sent. They carry sizes and tool names only, never tool output.
+  sent. They carry sizes, tool names and the model id only, never tool output.
 
 This module owns the API contract (paths, payloads, request limits): the rest of the
 SDK never builds a request.
@@ -80,6 +80,9 @@ class Api:
             return None
         try:
             return self._read_scores(self._http.send(http_request), len(request.sections))
+        except _RejectedError as error:
+            logger.warning("relevance API rejected this result, passed whole: %s", error)
+            return None
         except Exception as error:  # the API must never break the agent
             self._pause(error)
             return None
@@ -93,6 +96,9 @@ class Api:
             self._async_http = httpx.AsyncClient(headers=self._headers, timeout=TIMEOUT_SECONDS)
         try:
             return self._read_scores(await self._async_http.send(http_request), len(request.sections))
+        except _RejectedError as error:
+            logger.warning("relevance API rejected this result, passed whole: %s", error)
+            return None
         except Exception as error:  # the API must never break the agent
             self._pause(error)
             return None
@@ -113,6 +119,9 @@ class Api:
 
     @staticmethod
     def _read_scores(response: httpx.Response, expected: int) -> list[float]:
+        # A request the API rejects (too big, malformed) is this call's problem: the next one may score fine.
+        if response.status_code in (400, 413, 422):
+            raise _RejectedError(f"HTTP {response.status_code}: {response.text[:160]}")
         response.raise_for_status()
         scores = response.json().get("scores")
         if not isinstance(scores, list) or len(scores) != expected:
@@ -132,11 +141,12 @@ class Api:
     # ---- usage reports ----
 
     def report_result(
-        self, *, call_id: str, tool: str, result: ShrinkResult, ms: int, integration: str
+        self, *, call_id: str, tool: str, result: ShrinkResult, ms: int, integration: str, model: str | None
     ) -> None:
         """Queues the report of one shrunk result. Never blocks, never raises."""
         self._reports.add(
             {
+                **({"model": model} if model else {}),
                 "type": "result",
                 "callId": _api_call_id(call_id),
                 "tool": tool,
@@ -192,6 +202,10 @@ class Api:
 
     def _agent_field(self) -> dict[str, str]:
         return {"agent": self._agent} if self._agent else {}
+
+
+class _RejectedError(Exception):
+    """The API refused one scoring request: no reason to pause scoring for the others."""
 
 
 class _ReportQueue:

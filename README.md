@@ -93,6 +93,8 @@ async with AsyncContextwaise(agent="support-triage") as cw:
             ...
 ```
 
+Pass `full=lambda tool, args: ...` to `ContextwaiseAgent` for calls whose output must reach the model whole (a tool's schema, a list of actions to pick from). The adapter also reports the model id with each result, for your dashboard.
+
 ### Anthropic and OpenAI SDKs
 
 The adapters do the loop body for you: one call per model response runs your tools and returns what to send back, each output shrunk, `expand` answered, and a tool that raises reported to the model as an error. `run(name, args)` returns your tool's raw output.
@@ -138,7 +140,7 @@ async with AsyncContextwaise(agent="support-triage") as cw:
 
 | Option | Default | What it does |
 |---|---|---|
-| `api_key` | `CONTEXTWAISE_API_KEY` | Your Contextwaise key (`sw_live_…`). Relevance is then judged by the API (Jev), and results are reported to your dashboard: sizes and tool names only, never tool output. Without a key, only the local cleanup runs: noise is removed, nothing relevant is ever cut. |
+| `api_key` | `CONTEXTWAISE_API_KEY` | Your Contextwaise key (`sw_live_…`). Relevance is then judged by the API (Jev), and results are reported to your dashboard: sizes, tool names and the model id only, never tool output. Without a key, only the local cleanup runs: noise is removed, nothing relevant is ever cut. |
 | `base_url` | `CONTEXTWAISE_URL` | Where your Contextwaise app runs. Required with a key. |
 | `agent` | — | Groups this agent's results on the dashboard. |
 | `max_tokens` | `600` | Budget for the model's view of one tool result. |
@@ -146,7 +148,7 @@ async with AsyncContextwaise(agent="support-triage") as cw:
 | `full` | — | Tools whose output always reaches the model whole. |
 | `ledger` | in memory, last 5,000 calls | Where originals and views live. Implement `get(key)` / `set(key, entry)` over Redis or a database for agents spread over processes. |
 
-The API is never in the agent's way: scoring times out after 4 s and is then skipped for 30 s; meanwhile the model reads the cleaned output whole (nothing is cut without the API). Reports are batched and sent from a background thread, and dropped if they can't be sent. Leave the `with` block (or call `close()`) before a short-lived process exits, so pending reports are sent.
+The API is never in the agent's way: scoring times out after 4 s and is then skipped for 30 s (a single result the API rejects as too big is just passed whole); meanwhile the model reads the cleaned output whole (nothing is cut without the API). Reports are batched and sent from a background thread, and dropped if they can't be sent. Leave the `with` block (or call `close()`) before a short-lived process exits, so pending reports are sent.
 
 Decisions are logged on the `contextwaise` logger (`DEBUG`), API problems at `WARNING`.
 

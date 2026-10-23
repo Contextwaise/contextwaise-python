@@ -34,7 +34,7 @@ import os
 import re
 import time
 from collections import Counter
-from collections.abc import Awaitable, Callable, Generator, Iterable, Mapping
+from collections.abc import Awaitable, Callable, Generator, Iterable, Mapping, Set
 from typing import Any, TypeVar, cast
 
 from ._api import Api, ScoreRequest
@@ -66,6 +66,10 @@ TIE_BREAK = 0.05
 # call resending the whole conversation: a small saving can't pay for that risk.
 MIN_TRIM_SAVING = 1000
 MIN_TRIM_SHARE = 0.3
+# When the prompt size is known, a cut must also save this share of it: about what a wrong
+# cut costs (one expand resends the prompt) times how often cuts get expanded, with margin.
+# Measured: a 2.2K result cut to save 2.1K tokens in a 21K conversation, expanded at once.
+EXPAND_RISK = 0.25
 # Below this a section is noise for the current intent: the API's Jev scores put
 # "loosely related, not needed" up to ~0.4 and "useful evidence" from 0.5.
 MIN_RELEVANCE = 0.45
@@ -149,21 +153,36 @@ class BaseContextwaise:
         self._full = frozenset(full)
         self._ledger: Ledger = ledger if ledger is not None else MemoryLedger()
         self._intents: BoundedDict[str, str] = BoundedDict(MAX_TRACKED_CALLS)
+        # Call id → tokens of the prompt that made the call.
+        self._contexts: BoundedDict[str, int] = BoundedDict(MAX_TRACKED_CALLS)
+        # Call id → parts the model already has (its view and earlier expands).
+        self._shown: BoundedDict[str, set[int]] = BoundedDict(MAX_TRACKED_CALLS)
 
-    def note_intent(self, call_id: str, text: str) -> None:
+    def note_intent(self, call_id: str, text: str, *, context_tokens: int | None = None) -> None:
         """Records why the agent made a tool call, before its result is shrunk.
 
         Pass what the model was asked and the text it wrote just before the call
         ("let me find the auth middleware"): arguments alone often don't say (``ls .``).
+        ``context_tokens``: the size of the prompt that made the call. A cut must save more
+        the bigger it is, since a wrong cut costs an expand: one more model call resending all of it.
         """
         text = text.strip()
         if text:
             self._intents.set(call_id, text[-MAX_NOTED_INTENT_CHARS:])
+        if context_tokens:
+            self._contexts.set(call_id, context_tokens)
 
     # ---- shrink ----
 
     def _shrink_steps(
-        self, call_id: str, tool: str, args: Any, output: Any, integration: str = "python"
+        self,
+        call_id: str,
+        tool: str,
+        args: Any,
+        output: Any,
+        integration: str = "python",
+        model: str | None = None,
+        full: bool = False,
     ) -> Steps[ShrinkResult]:
         ref = _ref(call_id)
         known = self._ledger.get(ref)
@@ -174,6 +193,7 @@ class BaseContextwaise:
         started = time.perf_counter()
         original = output if isinstance(output, str) else _to_json_text(output)
         intent = " · ".join(filter(None, [self._intents.pop(call_id), _intent_of(tool, args)]))
+        min_saving = max(MIN_TRIM_SAVING, EXPAND_RISK * (self._contexts.pop(call_id) or 0))
         size = tokens(original)
         # The untouched view: what the model reads when no smaller one is worth sending.
         base = ShrinkResult(
@@ -186,7 +206,11 @@ class BaseContextwaise:
             intent=intent,
         )
 
-        result = yield from self._view_steps(base, call_id, tool, original)
+        try:
+            result = yield from self._view_steps(base, call_id, tool, original, min_saving, full)
+        except Exception:  # a view must never cost the agent its result: the output passes as is
+            logger.exception("shrink failed for %s (%s): output passed as is", call_id, tool)
+            result = base
         if result.mode != "full" and result.tokens_after >= result.tokens_before:
             result = dataclasses.replace(
                 base, kind=result.kind, notes=("no smaller view possible: sent as is",)
@@ -198,19 +222,30 @@ class BaseContextwaise:
             "shrink %s (%s): %s, %d → %d tokens", call_id, tool, result.mode, size, result.tokens_after
         )
         if self._api:
-            self._api.report_result(call_id=call_id, tool=tool, result=result, ms=ms, integration=integration)
+            self._api.report_result(
+                call_id=call_id, tool=tool, result=result, ms=ms, integration=integration, model=model
+            )
         return result
 
-    def _view_steps(self, base: ShrinkResult, call_id: str, tool: str, original: str) -> Steps[ShrinkResult]:
+    def _view_steps(
+        self, base: ShrinkResult, call_id: str, tool: str, original: str, min_saving: float, full: bool
+    ) -> Steps[ShrinkResult]:
         """The view, from cheapest to most involved: untouched, noise removed, relevant parts."""
+        if full:
+            return dataclasses.replace(base, notes=("this call is set to pass whole",))
         if tool in self._full:
             return dataclasses.replace(base, notes=(f'"{tool}" is set to always pass whole',))
+
+        def worth_cutting(whole_tokens: int, cut_tokens: int) -> bool:
+            saving = whole_tokens - cut_tokens
+            return saving >= min_saving and saving >= MIN_TRIM_SHARE * whole_tokens
+
         budget = self._budgets.get(tool, self._max_tokens)
         shaped = shape(original)
 
         def whole(notes: tuple[str, ...], scorer: Scorer = "none") -> ShrinkResult:
             if not notes:
-                return dataclasses.replace(base, kind=shaped.kind)
+                return dataclasses.replace(base, kind=shaped.kind, scorer=scorer)
             text = f"{shaped.text}\n[contextwaise: {'; '.join(notes)}. Everything else is shown in full.]"
             return dataclasses.replace(
                 base,
@@ -222,7 +257,7 @@ class BaseContextwaise:
                 scorer=scorer,
             )
 
-        if tokens(shaped.text) <= budget or not _worth_cutting(tokens(shaped.text), budget):
+        if tokens(shaped.text) <= budget or not worth_cutting(tokens(shaped.text), budget):
             return whole(shaped.notes)  # nothing to score: the API isn't called
 
         units = sections(shaped)
@@ -236,14 +271,23 @@ class BaseContextwaise:
         if max(scores) - min(scores) < 0.05 and tokens(shaped.text) <= budget * UNIFORM_KEEP_FACTOR:
             return whole((*shaped.notes, "every part equally relevant: kept whole"), "jev")
 
-        picked = _pick(units, scores, budget)
+        picked = _pick(units, scores, budget, shaped.kind)
         kept = sum(log.kept for log in picked)
+        # Nothing fits the budget (one part bigger than all of it): an empty view only sends the
+        # model to expand, one more call resending the conversation. Send the output instead.
+        if not kept:
+            return whole(shaped.notes, "jev")
         footer = _footer(
-            base.ref, base.tokens_before, kept, len(units), _omitted_summary(units, picked, shaped.kind)
+            base.ref,
+            base.tokens_before,
+            kept,
+            len(units),
+            _omitted_summary(units, picked, shaped.kind),
+            shaped.notes,
         )
         text = f"{_render(units, picked, shaped.kind)}\n{footer}"
         # Errors are kept over budget: the actual cut can be smaller than planned.
-        if not _worth_cutting(tokens(shaped.text), tokens(text)):
+        if not worth_cutting(tokens(shaped.text), tokens(text)):
             return whole(shaped.notes, "jev")
         return dataclasses.replace(
             base,
@@ -270,8 +314,18 @@ class BaseContextwaise:
             scores = yield from self._score_steps(
                 f"{entry.call_id}:x{_digest(question)}", entry.tool, question, units
             )
-        if scores is not None:
-            text = _render(units, _pick(units, scores, EXPAND_BUDGET), shaped.kind)
+        # Parts the model already has, in the view or from an earlier expand, are not sent again:
+        # asked twice, expand returns the next most relevant parts, so a model that didn't get what
+        # it needed can't loop on the same answer (each loop is a model call resending everything).
+        seen = self._shown.get(entry.call_id)
+        if seen is None:
+            seen = {i for i, log in enumerate(entry.result.sections) if log.kept}
+        picked = _pick(units, scores, EXPAND_BUDGET, shaped.kind, seen) if scores is not None else None
+        if picked is not None and seen and not any(log.kept and log.reason != "preview" for log in picked):
+            text = f"Nothing more in {ref} matches that question: its relevant parts are already shown above."
+        elif picked is not None:
+            self._shown.set(entry.call_id, seen | {i for i, log in enumerate(picked) if log.kept})
+            text = _render(units, picked, shaped.kind)
         elif tokens(entry.original) <= EXPAND_BUDGET:
             text = entry.original
         else:
@@ -360,7 +414,10 @@ def _to_json_text(value: Any) -> str:
             return dataclasses.asdict(item)
         return str(item)
 
-    return json.dumps(value, ensure_ascii=False, separators=(",", ":"), default=fields)
+    try:
+        return json.dumps(value, ensure_ascii=False, separators=(",", ":"), default=fields)
+    except ValueError:  # circular: no provider could send it as JSON either
+        return str(value)
 
 
 def _intent_of(tool: str, args: Any) -> str:
@@ -426,17 +483,21 @@ def _group_consecutive(units: list[str], max_groups: int) -> list[tuple[str, int
     ]
 
 
-def _pick(units: list[str], scores: list[float], budget: int) -> tuple[SectionLog, ...]:
+def _pick(
+    units: list[str], scores: list[float], budget: int, kind: Kind, exclude: Set[int] = frozenset()
+) -> tuple[SectionLog, ...]:
     """Keeps error sections, then the most relevant ones, within budget; drops the rest.
 
-    Order is preserved.
+    Order is preserved. ``exclude``: parts never to pick (already shown to the model).
     """
     sizes = [tokens(u) for u in units]
-    errors = [any(is_error_line(line) for line in u.split("\n")) for u in units]
+    errors = [_is_error_unit(u, kind) for u in units]
     kept = [False] * len(units)
     reasons: list[SectionReason] = ["low_relevance"] * len(units)
     used = 0
     for i in sorted(range(len(units)), key=lambda i: (not errors[i], -scores[i], i)):
+        if i in exclude:
+            continue
         if not errors[i] and scores[i] < MIN_RELEVANCE:
             continue
         if used + sizes[i] > budget and used > 0:
@@ -449,7 +510,7 @@ def _pick(units: list[str], scores: list[float], budget: int) -> tuple[SectionLo
     # model sees what kind of output this is and can expand with a better question.
     if "relevant" not in reasons:
         for i in range(len(units)):
-            if kept[i]:
+            if kept[i] or i in exclude:
                 continue
             if used + sizes[i] > budget / 2:
                 break
@@ -468,10 +529,17 @@ def _pick(units: list[str], scores: list[float], budget: int) -> tuple[SectionLo
     )
 
 
-def _worth_cutting(whole_tokens: int, cut_tokens: int) -> bool:
-    """Whether a view of ``cut_tokens`` saves enough over sending ``whole_tokens``."""
-    saving = whole_tokens - cut_tokens
-    return saving >= MIN_TRIM_SAVING and saving >= MIN_TRIM_SHARE * whole_tokens
+_ERROR_KEY = re.compile(r"(?:errors?|exception|fault)\b", re.IGNORECASE | re.ASCII)
+
+
+def _is_error_unit(unit: str, kind: Kind) -> bool:
+    """A part reporting a problem, kept first. In JSON only an error field counts: an item that
+    merely mentions one ("payment": "failed", "timeout": 30) is data, and would crowd out the
+    relevant ones."""
+    if kind != "json":
+        return any(is_error_line(line) for line in unit.split("\n"))
+    value = json.loads(unit)
+    return isinstance(value, dict) and any(_ERROR_KEY.match(key) for key in value)
 
 
 def _render(units: list[str], picked: tuple[SectionLog, ...], kind: Kind) -> str:
@@ -546,12 +614,15 @@ def _record(unit: str) -> dict[str, Any] | None:
     return value if isinstance(value, dict) else None
 
 
-def _footer(ref: str, original_tokens: int, kept: int, total: int, omitted: str) -> str:
+def _footer(
+    ref: str, original_tokens: int, kept: int, total: int, omitted: str, notes: tuple[str, ...]
+) -> str:
     """Only trimmed views invite expand: an invitation on a view that lost nothing but
     noise makes careful models spend a whole extra round trip to "check for more"."""
     what = f" Omitted: {omitted}." if omitted else ""
+    also = f" Also {'; '.join(notes)}." if notes else ""
     return (
         f"[contextwaise: kept the {kept} of {total} parts relevant to this step "
-        f"(of {original_tokens} tokens).{what} "
+        f"(of {original_tokens} tokens).{what}{also} "
         f'If you need an omitted part, call expand({{ ref: "{ref}", question: "<what you need>" }})]'
     )

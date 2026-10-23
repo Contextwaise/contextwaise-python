@@ -1,8 +1,10 @@
 from __future__ import annotations
 
+import json
 import re
 
 from contextwaise import shape
+from contextwaise._shapers import MAX_PART_TOKENS, sections, tokens
 from tests.stubs import TEST_RUN
 
 
@@ -91,3 +93,42 @@ def test_tables_and_dumps_are_line_oriented_but_prose_and_code_are_not() -> None
     assert shape(csv).text == csv, "rows are kept as they are: no collapsing of near-identical lines"
     code = "\n\n".join(f"def f{i}(x):\n    y = x + {i}\n    return y * 2" for i in range(12))
     assert shape(code).kind == "text"
+
+
+def test_a_big_json_value_is_cut_into_path_named_parts() -> None:
+    schema = {"input_schema": {"properties": {f"field_{i}": {"description": "d" * 300} for i in range(40)}}}
+    shaped = shape(json.dumps(schema))
+    units = sections(shaped)
+    assert len(units) == 40
+    assert units[3].startswith('{"input_schema.properties.field_3":')
+
+
+def test_an_mcp_result_is_unwrapped_and_the_json_string_inside_cut_like_json() -> None:
+    inner = json.dumps({"rows": [{"id": i, "text": "t" * 400} for i in range(30)]})
+    shaped = shape(json.dumps({"content": [{"type": "text", "text": inner}]}))
+    assert shaped.kind == "json"
+    assert "unwrapped the MCP result" in shaped.notes
+    assert len(sections(shaped)) == 30
+    error = json.dumps({"content": [{"type": "text", "text": "boom"}], "isError": True})
+    assert shape(error).text == "Error: boom"
+
+
+def test_no_part_is_bigger_than_the_limit_even_on_one_long_line() -> None:
+    xml = (
+        "<orders>"
+        + "".join(f'<order id="ORD-{i}"><c>Customer {i}</c></order>' for i in range(500))
+        + "</orders>"
+    )
+    units = sections(shape(xml))
+    assert len(units) > 5
+    assert all(tokens(u) <= MAX_PART_TOKENS for u in units)
+
+
+def test_fenced_or_introduced_json_is_cleaned_as_json() -> None:
+    data = json.dumps([{"id": 1, "note": None}])
+    fenced = shape(f"```json\n{data}\n```")
+    assert (fenced.kind, fenced.text) == ("json", '[{"id":1}]')
+    introduced = shape(f"Found 1 order:\n{data}")
+    assert introduced.kind == "json"
+    assert 'text before the JSON: "Found 1 order:"' in introduced.notes
+    assert shape(f"Error: quota exceeded\n{data}").kind != "json", "an error before the JSON stays visible"

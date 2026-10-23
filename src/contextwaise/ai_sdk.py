@@ -24,7 +24,7 @@ from __future__ import annotations
 
 import asyncio
 import json
-from collections.abc import AsyncGenerator, Sequence
+from collections.abc import AsyncGenerator, Callable, Sequence
 from typing import Any
 
 import ai
@@ -60,15 +60,29 @@ class ContextwaiseAgent(ai.Agent):
     ``loop`` only if you also replace the default loop: the shrinking lives there.
     """
 
-    def __init__(self, cw: AsyncContextwaise, *, tools: Sequence[ai.AgentTool]) -> None:
+    def __init__(
+        self,
+        cw: AsyncContextwaise,
+        *,
+        tools: Sequence[ai.AgentTool],
+        full: Callable[[str, Any], bool] | None = None,
+    ) -> None:
+        """``full``: calls whose output must reach the model whole, e.g. a tool listing its
+        actions or returning a schema the next call must follow exactly. Cut, the agent
+        expands it back piece by piece."""
         # Tool call id → size of the step that asked for that expand, until it runs.
         self._step_tokens: dict[str, int] = {}
         super().__init__(tools=[*tools, _expand_tool(cw, self._step_tokens)])
         self._cw = cw
+        self._full = full
 
     async def loop(self, context: ai.Context) -> AsyncGenerator[Any]:
         while context.keep_running():
             said = _last_user_text(context.messages)
+            # The step's input, estimated once: the provider's count only arrives after the
+            # tools have started running. It decides how much a cut must save, and for an
+            # expand, what the extra step it caused cost.
+            step_size = _model_tokens(context.messages)
             args: dict[str, Any] = {}
             async with ai.stream(context=context) as stream, ai.ToolRunner() as runner:
                 async for event in ai.util.merge(stream, runner.events()):
@@ -77,20 +91,19 @@ class ContextwaiseAgent(ai.Agent):
                         said += event.chunk
                     elif isinstance(event, ai.events.ToolEnd):
                         call = event.tool_call
-                        self._cw.note_intent(call.tool_call_id, said)
+                        self._cw.note_intent(call.tool_call_id, said, context_tokens=step_size)
                         if call.tool_name == EXPAND_TOOL["name"]:
-                            # The step's input, estimated: the provider's count only
-                            # arrives after the tools have started running.
-                            self._step_tokens[call.tool_call_id] = _model_tokens(context.messages)
+                            self._step_tokens[call.tool_call_id] = step_size
                         args[call.tool_call_id] = json.loads(call.tool_args) if call.tool_args else {}
                         runner.schedule(self.resolve(call))
                 context.add(stream.message)
                 results = runner.get_tool_message()
                 if results is not None:
-                    await asyncio.gather(*(self._shrink(p, args) for p in results.tool_results))
+                    model = context.model.id
+                    await asyncio.gather(*(self._shrink(p, args, model) for p in results.tool_results))
                 context.add(results)
 
-    async def _shrink(self, part: ToolResultPart, args: dict[str, Any]) -> None:
+    async def _shrink(self, part: ToolResultPart, args: dict[str, Any], model: str) -> None:
         output = part.get_model_input()
         if part.is_error or part.tool_name == EXPAND_TOOL["name"] or isinstance(output, ContentOutput):
             return
@@ -100,6 +113,8 @@ class ContextwaiseAgent(ai.Agent):
             args=args.get(part.tool_call_id),
             output=output,
             integration=INTEGRATION,
+            model=model,
+            full=self._full is not None and self._full(part.tool_name, args.get(part.tool_call_id)),
         )
         part.set_model_input(view.text)
 
