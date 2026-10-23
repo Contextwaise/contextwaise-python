@@ -85,7 +85,7 @@ def test_expand_brings_back_what_was_trimmed(api: ApiStub) -> None:
     orders = tool_call(get_orders, customer="acme")
     expand = tool_call("expand", ref=_ref(orders.tool_call_id), question="Which carrier ships ORD-1337?")
     script = [
-        ai.user_message("How many orders are cancelled?"),
+        ai.user_message("What happened to order ORD-1001?"),
         ai.assistant_message(orders),
         ai.assistant_message(expand),
         ai.assistant_message("Done."),
@@ -93,7 +93,7 @@ def test_expand_brings_back_what_was_trimmed(api: ApiStub) -> None:
     parts = tool_parts(run(script, [get_orders]))
     view = parts["get_orders"].get_model_input()
     assert '"carrier":"Hermes"' not in view, "the order was trimmed away at first"
-    assert "carrier: DHL ×149, Hermes ×1" in view, "the note counts what was cut"
+    assert "carrier: DHL ×148, Hermes ×1" in view, "the note counts what was cut"
     assert "Hermes" in parts["expand"].get_model_input(), "expand brought it back, unshrunk"
     [expand] = [r for body in api.report_bodies for r in body["results"] if r["type"] == "expand"]
     assert len(view) // 4 < expand["contextTokens"] < len(ORDERS) // 4, (

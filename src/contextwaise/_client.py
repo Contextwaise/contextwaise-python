@@ -21,7 +21,15 @@ class Contextwaise(BaseContextwaise):
     """
 
     def shrink(
-        self, *, call_id: str, tool: str, output: Any, args: Any = None, integration: str = "python"
+        self,
+        *,
+        call_id: str,
+        tool: str,
+        output: Any,
+        args: Any = None,
+        integration: str = "python",
+        model: str | None = None,
+        full: bool = False,
     ) -> ShrinkResult:
         """The model's view of a tool result. Same ``call_id``, same view, always.
 
@@ -32,11 +40,17 @@ class Contextwaise(BaseContextwaise):
                 (Pydantic models and dataclasses are serialized by their fields).
             args: The arguments the model called the tool with (a dict, or JSON text).
             integration: Which adapter called, shown on the dashboard. Adapters set it.
+            model: The model id that will read the result (e.g. ``"claude-sonnet-4-5"``), shown
+                with the agent on the dashboard.
+            full: This call's output must reach the model whole (a tool's schema, a list of
+                actions to pick from), like the tools in the ``full`` option.
 
         Returns:
             The view; send ``result.text`` to the model as the tool result.
         """
-        return run_steps(self._shrink_steps(call_id, tool, args, output, integration), self._score)
+        return run_steps(
+            self._shrink_steps(call_id, tool, args, output, integration, model, full), self._score
+        )
 
     def expand(self, ref: str, question: str | None = None, *, context_tokens: int | None = None) -> str:
         """The original output behind a ref, or its parts answering ``question``.
@@ -82,13 +96,23 @@ class AsyncContextwaise(BaseContextwaise):
     """
 
     async def shrink(
-        self, *, call_id: str, tool: str, output: Any, args: Any = None, integration: str = "python"
+        self,
+        *,
+        call_id: str,
+        tool: str,
+        output: Any,
+        args: Any = None,
+        integration: str = "python",
+        model: str | None = None,
+        full: bool = False,
     ) -> ShrinkResult:
         """The model's view of a tool result. Same ``call_id``, same view, always.
 
         See ``Contextwaise.shrink``.
         """
-        return await arun_steps(self._shrink_steps(call_id, tool, args, output, integration), self._score)
+        return await arun_steps(
+            self._shrink_steps(call_id, tool, args, output, integration, model, full), self._score
+        )
 
     async def expand(
         self, ref: str, question: str | None = None, *, context_tokens: int | None = None

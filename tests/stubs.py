@@ -37,12 +37,16 @@ class ApiStub:
         self.score_bodies: list[dict[str, Any]] = []
         self.report_bodies: list[dict[str, Any]] = []
         self.down = False
+        self.reject_next = False
 
     def score(self, request: httpx.Request) -> httpx.Response:
         body = json.loads(request.content)
         self.score_bodies.append(body)
         if self.down:
             return httpx.Response(503, text="down")
+        if self.reject_next:
+            self.reject_next = False
+            return httpx.Response(422, json={"error": {"code": "invalid_request"}})
         # Like the real API: one oversized section rejects the whole call.
         if any(len(s) > 20_000 for s in body["sections"]):
             return httpx.Response(422, json={"error": {"code": "invalid_request"}})

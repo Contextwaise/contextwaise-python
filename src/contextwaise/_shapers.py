@@ -49,10 +49,55 @@ def is_error_line(line: str) -> bool:
     return _ERROR_LINE.search(line) is not None
 
 
+def _unwrap_mcp(raw: str, notes: list[str]) -> str:
+    """MCP tools wrap their result: ``{"content":[{"type":"text","text":"…"}]}``, the data inside
+    as one string (often JSON). Left wrapped, it is a single unsplittable part: over any budget,
+    so a cut keeps nothing. Unwrapped, it is cleaned and cut like any output. Results with
+    images or other non-text parts stay as they are."""
+    if not raw.lstrip().startswith("{") or '"content"' not in raw:
+        return raw
+    try:
+        value = json.loads(raw)
+    except ValueError:
+        return raw
+    parts = value.get("content") if isinstance(value, dict) else None
+    if not isinstance(parts, list) or not parts:
+        return raw
+    if not all(
+        isinstance(p, dict) and p.get("type") == "text" and isinstance(p.get("text"), str) for p in parts
+    ):
+        return raw
+    notes.append("unwrapped the MCP result")
+    text = "\n\n".join(p["text"] for p in parts)
+    return f"Error: {text}" if value.get("isError") is True else text
+
+
+_FENCED = re.compile(r"```[\w-]*\n([\s\S]*)\n```", re.ASCII)
+_JSON_START = re.compile(r"^[\[{]", re.MULTILINE)
+
+
+def _unwrap_json(text: str, notes: list[str]) -> str:
+    """JSON inside a code fence, or after a short line of text ("Found 80 orders:"), as some
+    tools and MCP servers return it. Left as text it is one part, over any budget, so never
+    cut. The text around it is kept as a note; one reporting an error keeps the output as text."""
+    fenced = _FENCED.fullmatch(text)
+    if fenced and _parse_json(fenced[1].strip()) is not _NOT_JSON:
+        notes.append("removed the code fence around the JSON")
+        return fenced[1].strip()
+    start = _JSON_START.search(text)
+    if start is None or not 0 < start.start() <= 300:
+        return text
+    before, rest = text[: start.start()].strip(), text[start.start() :].strip()
+    if is_error_line(before) or _parse_json(rest) is _NOT_JSON:
+        return text
+    notes.append(f'text before the JSON: "{before}"')
+    return rest
+
+
 def shape(raw: str) -> Shaped:
     """Removes the noise from a tool output. Lossless for anything a reader would need."""
     notes: list[str] = []
-    text = _strip_terminal_noise(raw, notes)
+    text = _unwrap_json(_strip_terminal_noise(_unwrap_mcp(raw, notes), notes), notes)
     value = _parse_json(text)
     if value is not _NOT_JSON:
         return Shaped("json", _shape_json(text, value, notes), tuple(notes))
@@ -68,26 +113,101 @@ def shape(raw: str) -> Shaped:
     return Shaped(kind, text, tuple(notes))
 
 
+# No part is bigger than this: a JSON part is cut into its keys or items, named by path
+# (`input_schema.properties.mode`), text into lines, a long line into pieces. Whole, a part
+# over the budget is never kept: a tool's 15K-token schema, an XML or minified document on one
+# line, passed whole or left the agent expanding for everything but it.
+MAX_PART_TOKENS = 500
+
+
 def sections(shaped: Shaped) -> list[str]:
-    """Cuts a shaped output into the units relevance is judged on."""
+    """Cuts a shaped output into the units relevance is judged on, none over ``MAX_PART_TOKENS``."""
     if shaped.kind == "json":
         value = json.loads(shaped.text)
         if isinstance(value, list):
-            return [_compact(item) for item in value]
+            return [
+                unit
+                for i, item in enumerate(value)
+                for unit in (
+                    [_compact(item)]
+                    if tokens(_compact(item)) <= MAX_PART_TOKENS
+                    else _json_parts(f"[{i}]", item)
+                )
+            ]
         # API envelopes ({ meta, orders: [...] }) put the data in an array under one key:
         # each item becomes its own unit (keyed `orders[3]`), or the whole array would be one part.
         units: list[str] = []
         for key, item in value.items():
             if isinstance(item, list) and len(item) > 1:
-                units.extend(_compact({f"{key}[{i}]": element}) for i, element in enumerate(item))
+                units.extend(
+                    unit for i, element in enumerate(item) for unit in _json_parts(f"{key}[{i}]", element)
+                )
             else:
-                units.append(_compact({key: item}))
+                units.extend(_json_parts(key, item))
         return units
     if shaped.kind in ("listing", "log", "lines"):
-        return [line for line in shaped.text.split("\n") if line.strip()]  # listing: one directory per line
-    if shaped.kind == "test":
-        return [block for block in _TEST_BLOCK.split(shaped.text) if block.strip()]
-    return [paragraph for paragraph in _PARAGRAPH.split(shaped.text) if paragraph.strip()]
+        units = [line for line in shaped.text.split("\n") if line.strip()]  # listing: one directory per line
+    elif shaped.kind == "test":
+        units = [block for block in _TEST_BLOCK.split(shaped.text) if block.strip()]
+    else:
+        units = [paragraph for paragraph in _PARAGRAPH.split(shaped.text) if paragraph.strip()]
+    return [
+        piece
+        for unit in units
+        for piece in ([unit] if tokens(unit) <= MAX_PART_TOKENS else _text_chunks(unit))
+    ]
+
+
+def _json_parts(path: str, value: Any) -> list[str]:
+    """``value`` under ``path`` as one unit, or as its children's units when it is too big."""
+    part = _compact({path: value})
+    if tokens(part) <= MAX_PART_TOKENS:
+        return [part]
+    if isinstance(value, str):
+        # JSON stored as a string (an API embedding a document) is cut like JSON; long text by lines.
+        inner = _parse_json(value.strip())
+        if inner is not _NOT_JSON:
+            return _json_parts(path, inner)
+        chunks = _text_chunks(value)
+        return [
+            _compact({f"{path} ({i + 1}/{len(chunks)})" if len(chunks) > 1 else path: c})
+            for i, c in enumerate(chunks)
+        ]
+    if isinstance(value, dict):
+        children = [(f"{path}.{k}", v) for k, v in value.items()]
+    elif isinstance(value, list):
+        children = [(f"{path}[{i}]", v) for i, v in enumerate(value)]
+    else:
+        return [part]
+    return [unit for p, v in children for unit in _json_parts(p, v)] if children else [part]
+
+
+def _text_chunks(text: str) -> list[str]:
+    """Consecutive lines packed into chunks of about ``MAX_PART_TOKENS``; a longer line is cut into pieces."""
+    chunks: list[str] = []
+    current = ""
+    for piece in (piece for line in text.split("\n") for piece in _line_chunks(line)):
+        if current and tokens(current) + tokens(piece) > MAX_PART_TOKENS:
+            chunks.append(current)
+            current = piece
+        else:
+            current = f"{current}\n{piece}" if current else piece
+    if current:
+        chunks.append(current)
+    return chunks
+
+
+def _line_chunks(line: str) -> list[str]:
+    """A line cut into pieces of at most ``MAX_PART_TOKENS``, each ending at a space or tag if any."""
+    limit = MAX_PART_TOKENS * 4
+    pieces: list[str] = []
+    while len(line) > limit:
+        window = line[:limit]
+        cut = max(window.rfind(" "), window.rfind(">"), window.rfind(","))
+        end = cut + 1 if cut > limit / 2 else limit
+        pieces.append(line[:end])
+        line = line[end:]
+    return [*pieces, line]
 
 
 _TEST_BLOCK = re.compile(r"\n(?=\S)")  # one block per unindented line
