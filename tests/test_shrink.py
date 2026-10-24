@@ -332,3 +332,32 @@ def test_a_request_the_api_rejects_does_not_pause_scoring(api: ApiStub) -> None:
         second = cw.shrink(call_id="next", tool="list_files", args={"q": "feature42"}, output=LISTING)
     assert first.scorer == "none"
     assert second.scorer == "jev", "the next result is scored"
+
+
+def test_records_in_a_list_are_judged_whole(api: ApiStub) -> None:
+    def page(i: int, note: str) -> dict[str, object]:
+        return {
+            "object": "page",
+            "id": f"id-{i}",
+            "url": f"https://notion.so/ORD-{2000 + i}",
+            "properties": {
+                "Order ID": {"title": [{"plain_text": f"ORD-{2000 + i}", "annotations": {"bold": False}}]},
+                "Notes": {"rich_text": [{"plain_text": note, "annotations": {"bold": False}}]},
+                "padding": "p" * 2600,
+            },
+        }
+
+    pages = [
+        page(i, "Delivered damaged: clamp cracked" if i == 41 else "Customer confirmed reception")
+        for i in range(60)
+    ]
+    with connected(max_tokens=600) as cw:
+        view = cw.shrink(
+            call_id="records",
+            tool="query",
+            args={"q": "which order was damaged"},
+            output={"data": {"results": pages}},
+        )
+    assert view.mode == "trimmed"
+    assert re.search(r"ORD-2041[\s\S]*Delivered damaged", view.text), "the record with its notes, whole"
+    assert sum(s.kept for s in view.sections) == 1

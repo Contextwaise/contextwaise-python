@@ -353,8 +353,7 @@ class BaseContextwaise:
         # listings) would cost several times the text itself (measured: 8.9x for a
         # 1,214-line log). Score consecutive groups instead, each line taking its
         # group's score; errors are still kept on their own.
-        count = min(MAX_REMOTE_SECTIONS, max(1, math.ceil(tokens("\n".join(units)) / MIN_GROUP_TOKENS)))
-        groups = _group_consecutive(units, count)
+        groups = _group_consecutive(units, MAX_REMOTE_SECTIONS)
         scores = yield ScoreRequest(call_id, tool, intent, [_for_scoring(text, intent) for text, _ in groups])
         if scores is None:
             logger.debug("no relevance for %s: cleaned output passed whole", call_id)
@@ -473,10 +472,20 @@ def _for_scoring(text: str, intent: str) -> str:
 
 
 def _group_consecutive(units: list[str], max_groups: int) -> list[tuple[str, int]]:
-    """Joins consecutive units into at most ``max_groups`` groups of similar size.
+    """Joins consecutive units into groups of about ``MIN_GROUP_TOKENS``, at most ``max_groups``.
 
+    Packed by size, not count: short lines share a group (one Jev question for many), while a
+    unit that is big on its own (a record) is scored alone, never tied with its neighbour.
     Returns (text, exclusive end index) pairs.
     """
+    packed: list[tuple[str, int]] = []
+    for i, unit in enumerate(units):
+        if packed and tokens(packed[-1][0]) + tokens(unit) <= MIN_GROUP_TOKENS:
+            packed[-1] = (f"{packed[-1][0]}\n{unit}", i + 1)
+        else:
+            packed.append((unit, i + 1))
+    if len(packed) <= max_groups:
+        return packed
     size = math.ceil(len(units) / max_groups)
     return [
         ("\n".join(units[start : start + size]), min(start + size, len(units)))

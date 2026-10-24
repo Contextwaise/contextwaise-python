@@ -118,6 +118,10 @@ def shape(raw: str) -> Shaped:
 # over the budget is never kept: a tool's 15K-token schema, an XML or minified document on one
 # line, passed whole or left the agent expanding for everything but it.
 MAX_PART_TOKENS = 500
+# A list item is a record (an order, a row, a page): judged whole up to this size, so relevance
+# reads one order with its notes, not its `created_time`, `id` and `in_trash` fields apart. API
+# records run large (a Notion page object is ~700-1,300 tokens).
+MAX_RECORD_TOKENS = 2500
 
 
 def sections(shaped: Shaped) -> list[str]:
@@ -130,7 +134,7 @@ def sections(shaped: Shaped) -> list[str]:
                 for i, item in enumerate(value)
                 for unit in (
                     [_compact(item)]
-                    if tokens(_compact(item)) <= MAX_PART_TOKENS
+                    if tokens(_compact(item)) <= MAX_RECORD_TOKENS
                     else _json_parts(f"[{i}]", item)
                 )
             ]
@@ -140,7 +144,9 @@ def sections(shaped: Shaped) -> list[str]:
         for key, item in value.items():
             if isinstance(item, list) and len(item) > 1:
                 units.extend(
-                    unit for i, element in enumerate(item) for unit in _json_parts(f"{key}[{i}]", element)
+                    unit
+                    for i, element in enumerate(item)
+                    for unit in _json_parts(f"{key}[{i}]", element, MAX_RECORD_TOKENS)
                 )
             else:
                 units.extend(_json_parts(key, item))
@@ -158,10 +164,10 @@ def sections(shaped: Shaped) -> list[str]:
     ]
 
 
-def _json_parts(path: str, value: Any) -> list[str]:
-    """``value`` under ``path`` as one unit, or as its children's units when it is too big."""
+def _json_parts(path: str, value: Any, limit: int = MAX_PART_TOKENS) -> list[str]:
+    """``value`` under ``path`` as one unit, or as its children's units when it is over ``limit`` tokens."""
     part = _compact({path: value})
-    if tokens(part) <= MAX_PART_TOKENS:
+    if tokens(part) <= limit:
         return [part]
     if isinstance(value, str):
         # JSON stored as a string (an API embedding a document) is cut like JSON; long text by lines.
@@ -174,12 +180,12 @@ def _json_parts(path: str, value: Any) -> list[str]:
             for i, c in enumerate(chunks)
         ]
     if isinstance(value, dict):
-        children = [(f"{path}.{k}", v) for k, v in value.items()]
+        children = [(f"{path}.{k}", v, MAX_PART_TOKENS) for k, v in value.items()]
     elif isinstance(value, list):
-        children = [(f"{path}[{i}]", v) for i, v in enumerate(value)]
+        children = [(f"{path}[{i}]", v, MAX_RECORD_TOKENS) for i, v in enumerate(value)]
     else:
         return [part]
-    return [unit for p, v in children for unit in _json_parts(p, v)] if children else [part]
+    return [unit for p, v, most in children for unit in _json_parts(p, v, most)] if children else [part]
 
 
 def _text_chunks(text: str) -> list[str]:
