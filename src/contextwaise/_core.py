@@ -67,9 +67,10 @@ TIE_BREAK = 0.05
 MIN_TRIM_SAVING = 1000
 MIN_TRIM_SHARE = 0.3
 # When the prompt size is known, a cut must also save this share of it: about what a wrong
-# cut costs (one expand resends the prompt) times how often cuts get expanded, with margin.
-# Measured: a 2.2K result cut to save 2.1K tokens in a 21K conversation, expanded at once.
-EXPAND_RISK = 0.25
+# cut costs (one expand resends the prompt) times how often cuts get expanded. A cut saves on
+# every later step, an expand costs once. At 0.25, agents with big prompts (20-50K tokens of
+# instructions, tool lists and schemas) never cut even a 13K-token query result.
+EXPAND_RISK = 0.1
 # Below this a section is noise for the current intent: the API's Jev scores put
 # "loosely related, not needed" up to ~0.4 and "useful evidence" from 0.5.
 MIN_RELEVANCE = 0.45
