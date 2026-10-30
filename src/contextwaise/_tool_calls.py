@@ -87,6 +87,7 @@ def run_tool_calls(
     request: str | None,
     integration: str,
     context_tokens: int | None,
+    agent: str | None = None,
 ) -> list[ToolOutcome]:
     """Runs the calls in order and returns what the model should read for each: ``expand``
     answered by Contextwaise, other tools by ``run`` with their output shrunk, and a tool
@@ -107,7 +108,12 @@ def run_tool_calls(
                 outcomes.append(_error(call, str(error)))
                 continue
             view = cw.shrink(
-                call_id=call.id, tool=call.name, args=call.args, output=output, integration=integration
+                call_id=call.id,
+                tool=call.name,
+                args=call.args,
+                output=output,
+                integration=integration,
+                agent=agent,
             )
             outcomes.append(ToolOutcome(call.id, view.text, False))
     return outcomes
@@ -120,6 +126,7 @@ async def arun_tool_calls(
     request: str | None,
     integration: str,
     context_tokens: int | None,
+    agent: str | None = None,
 ) -> list[ToolOutcome]:
     """``run_tool_calls`` for asyncio: the calls run concurrently; ``run`` may be sync or async."""
 
@@ -138,7 +145,12 @@ async def arun_tool_calls(
         except Exception as error:  # the model should see the failure, not the agent crash
             return _error(call, str(error))
         view = await cw.shrink(
-            call_id=call.id, tool=call.name, args=call.args, output=output, integration=integration
+            call_id=call.id,
+            tool=call.name,
+            args=call.args,
+            output=output,
+            integration=integration,
+            agent=agent,
         )
         return ToolOutcome(call.id, view.text, False)
 

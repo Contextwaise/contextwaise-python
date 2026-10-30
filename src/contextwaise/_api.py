@@ -34,6 +34,8 @@ logger = logging.getLogger("contextwaise")
 
 TIMEOUT_SECONDS = 4.0
 PAUSE_AFTER_FAILURE_SECONDS = 30.0
+# The free tokens are used up: only an upgrade brings scoring back, so retrying every 30s is pointless.
+PAUSE_AFTER_QUOTA_SECONDS = 3600.0
 REPORT_BATCH = 50
 REPORT_DELAY_SECONDS = 2.0
 MAX_QUEUED_REPORTS = 1000
@@ -53,6 +55,8 @@ class ScoreRequest:
     tool: str
     intent: str
     sections: Sequence[str]
+    agent: str | None = None
+    """Overrides the client's agent, for apps hosting many agents on one client."""
 
 
 class Api:
@@ -83,6 +87,9 @@ class Api:
         except _RejectedError as error:
             logger.warning("relevance API rejected this result, passed whole: %s", error)
             return None
+        except _QuotaError as error:
+            self._pause(error, PAUSE_AFTER_QUOTA_SECONDS)
+            return None
         except Exception as error:  # the API must never break the agent
             self._pause(error)
             return None
@@ -99,6 +106,9 @@ class Api:
         except _RejectedError as error:
             logger.warning("relevance API rejected this result, passed whole: %s", error)
             return None
+        except _QuotaError as error:
+            self._pause(error, PAUSE_AFTER_QUOTA_SECONDS)
+            return None
         except Exception as error:  # the API must never break the agent
             self._pause(error)
             return None
@@ -113,7 +123,7 @@ class Api:
             # One oversized section would make the API reject the whole call: a huge
             # unit (one minified blob) is scored on its start instead.
             "sections": [_clip(section, _MAX_SECTION_CHARS) for section in request.sections],
-            **self._agent_field(),
+            **self._agent_field(request.agent),
         }
         return self._http.build_request("POST", f"{self._base_url}/api/v1/tool-results", json=body)
 
@@ -122,6 +132,8 @@ class Api:
         # A request the API rejects (too big, malformed) is this call's problem: the next one may score fine.
         if response.status_code in (400, 413, 422):
             raise _RejectedError(f"HTTP {response.status_code}: {response.text[:160]}")
+        if response.status_code == 429 and "quota_exceeded" in response.text:
+            raise _QuotaError(f"free Contextwaise tokens used up (upgrade in Billing): {response.text[:160]}")
         response.raise_for_status()
         scores = response.json().get("scores")
         if not isinstance(scores, list) or len(scores) != expected:
@@ -130,29 +142,35 @@ class Api:
             raise ValueError("scores must be numbers")
         return [float(s) for s in scores]
 
-    def _pause(self, error: Exception) -> None:
-        self._paused_until = time.monotonic() + PAUSE_AFTER_FAILURE_SECONDS
-        logger.warning(
-            "relevance API unavailable, passing cleaned outputs whole for %ds: %s",
-            PAUSE_AFTER_FAILURE_SECONDS,
-            error,
-        )
+    def _pause(self, error: Exception, seconds: float = PAUSE_AFTER_FAILURE_SECONDS) -> None:
+        self._paused_until = time.monotonic() + seconds
+        logger.warning("relevance API unavailable, passing cleaned outputs whole for %ds: %s", seconds, error)
 
     # ---- usage reports ----
 
     def report_result(
-        self, *, call_id: str, tool: str, result: ShrinkResult, ms: int, integration: str, model: str | None
+        self,
+        *,
+        call_id: str,
+        tool: str,
+        result: ShrinkResult,
+        ms: int,
+        integration: str,
+        model: str | None,
+        agent: str | None = None,
     ) -> None:
         """Queues the report of one shrunk result. Never blocks, never raises."""
         self._reports.add(
             {
                 **({"model": model} if model else {}),
+                **({"agent": agent} if agent else {}),
                 "type": "result",
                 "callId": _api_call_id(call_id),
                 "tool": tool,
                 "integration": integration,
                 "kind": result.kind,
                 "mode": result.mode,
+                "reason": result.reason,
                 "scorer": result.scorer,
                 "tokensBefore": result.tokens_before,
                 "tokensAfter": result.tokens_after,
@@ -160,9 +178,12 @@ class Api:
             }
         )
 
-    def report_expand(self, *, call_id: str, tool: str, tokens: int, context_tokens: int | None) -> None:
+    def report_expand(
+        self, *, call_id: str, tool: str, tokens: int, context_tokens: int | None, agent: str | None = None
+    ) -> None:
         """Queues the report of one expand. Never blocks, never raises."""
         report: dict[str, Any] = {
+            **({"agent": agent} if agent else {}),
             "type": "expand",
             "callId": _api_call_id(call_id),
             "tool": tool,
@@ -200,12 +221,17 @@ class Api:
         except Exception as error:  # reports must never break the agent
             logger.warning("usage report dropped (%d results): %s", len(batch), error)
 
-    def _agent_field(self) -> dict[str, str]:
-        return {"agent": self._agent} if self._agent else {}
+    def _agent_field(self, agent: str | None = None) -> dict[str, str]:
+        agent = agent or self._agent
+        return {"agent": agent} if agent else {}
 
 
 class _RejectedError(Exception):
     """The API refused one scoring request: no reason to pause scoring for the others."""
+
+
+class _QuotaError(Exception):
+    """The free tokens are used up: scoring pauses for long, since only an upgrade fixes it."""
 
 
 class _ReportQueue:

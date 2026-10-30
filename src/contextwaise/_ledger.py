@@ -19,6 +19,7 @@ class LedgerEntry:
     tool: str
     original: str
     result: ShrinkResult
+    agent: str | None = None
 
 
 class Ledger(Protocol):

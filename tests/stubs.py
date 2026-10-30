@@ -37,6 +37,7 @@ class ApiStub:
         self.score_bodies: list[dict[str, Any]] = []
         self.report_bodies: list[dict[str, Any]] = []
         self.down = False
+        self.quota_used_up = False
         self.reject_next = False
 
     def score(self, request: httpx.Request) -> httpx.Response:
@@ -44,6 +45,8 @@ class ApiStub:
         self.score_bodies.append(body)
         if self.down:
             return httpx.Response(503, text="down")
+        if self.quota_used_up:
+            return httpx.Response(429, json={"error": {"code": "quota_exceeded", "message": "used up"}})
         if self.reject_next:
             self.reject_next = False
             return httpx.Response(422, json={"error": {"code": "invalid_request"}})
