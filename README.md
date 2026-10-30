@@ -71,7 +71,9 @@ with Contextwaise(agent="support-triage", budgets={"read_file": 1500}) as cw:
 
 - Your code keeps the raw `output`; only the model's view changes.
 - `output` can be text or anything JSON-serializable (Pydantic models and dataclasses are serialized by their fields). `args` can be a dict or JSON text (OpenAI's `arguments`).
-- `shrink` returns a `ShrinkResult`: `text` (what the model reads), `mode` (`full`, `shaped` or `trimmed`), token counts before and after, and what was kept and why.
+- `shrink` returns a `ShrinkResult`: `text` (what the model reads), `mode` (`full`, `shaped` or `trimmed`), `reason` (why: `cut`, `fits_budget`, `small_saving`, `schema`, `marked_full`, `api_unavailable`, …), token counts before and after, and what was kept and why.
+- Hosting many agents on one client? Pass `agent=` to `shrink` (and to the Anthropic/OpenAI helpers) to group each call under its own agent.
+- Tool schemas and lists of actions (an MCP server describing its tools, OpenAI or Anthropic tool definitions, JSON Schema) are detected and always reach the model whole: the next call must follow them exactly.
 
 ### Vercel AI SDK for Python
 
@@ -93,7 +95,7 @@ async with AsyncContextwaise(agent="support-triage") as cw:
             ...
 ```
 
-Pass `full=lambda tool, args: ...` to `ContextwaiseAgent` for calls whose output must reach the model whole (a tool's schema, a list of actions to pick from). The adapter also reports the model id with each result, for your dashboard.
+Pass `full=lambda tool, args: ...` to `ContextwaiseAgent` for calls whose output must reach the model whole (e.g. a file the agent will edit; schemas and lists of actions already are), and `agent=` when one client serves many agents. The adapter also reports the model id with each result, for your dashboard.
 
 ### Anthropic and OpenAI SDKs
 
@@ -142,13 +144,13 @@ async with AsyncContextwaise(agent="support-triage") as cw:
 |---|---|---|
 | `api_key` | `CONTEXTWAISE_API_KEY` | Your Contextwaise key (`sw_live_…`). Relevance is then judged by the API (Jev), and results are reported to your dashboard: sizes, tool names and the model id only, never tool output. Without a key, only the local cleanup runs: noise is removed, nothing relevant is ever cut. |
 | `base_url` | `CONTEXTWAISE_URL` | Where your Contextwaise app runs. Required with a key. |
-| `agent` | — | Groups this agent's results on the dashboard. |
+| `agent` | — | Groups this agent's results on the dashboard. Each call can override it (`agent=` in `shrink`, `ContextwaiseAgent` and the Anthropic/OpenAI helpers). |
 | `max_tokens` | `600` | Budget for the model's view of one tool result. |
 | `budgets` | — | Per-tool budgets, e.g. `{"read_file": 1500}`: files up to that size reach the model whole. |
-| `full` | — | Tools whose output always reaches the model whole. |
+| `full` | — | Tools whose output always reaches the model whole. Schemas and lists of actions already are. |
 | `ledger` | in memory, last 5,000 calls | Where originals and views live. Implement `get(key)` / `set(key, entry)` over Redis or a database for agents spread over processes. |
 
-The API is never in the agent's way: scoring times out after 4 s and is then skipped for 30 s (a single result the API rejects as too big is just passed whole); meanwhile the model reads the cleaned output whole (nothing is cut without the API). Reports are batched and sent from a background thread, and dropped if they can't be sent. Leave the `with` block (or call `close()`) before a short-lived process exits, so pending reports are sent.
+The API is never in the agent's way: scoring times out after 4 s and is then skipped for 30 s, or an hour once the free tokens are used up (a single result the API rejects as too big is just passed whole); meanwhile the model reads the cleaned output whole (nothing is cut without the API). Reports are batched and sent from a background thread, and dropped if they can't be sent. Leave the `with` block (or call `close()`) before a short-lived process exits, so pending reports are sent.
 
 Decisions are logged on the `contextwaise` logger (`DEBUG`), API problems at `WARNING`.
 

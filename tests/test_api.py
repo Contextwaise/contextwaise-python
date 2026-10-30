@@ -30,6 +30,7 @@ def test_relevance_comes_from_the_api_and_results_and_expands_are_reported_in_on
     assert [r["type"] for r in report["results"]] == ["result", "expand"]
     assert report["results"][0]["tool"] == "list_files"
     assert report["results"][0]["integration"] == "python"
+    assert report["results"][0]["reason"] == "cut"
     assert "middleware" not in json.dumps(report), "reports never carry tool output"
 
 
@@ -85,3 +86,33 @@ def test_the_memory_ledger_keeps_only_the_most_recent_calls() -> None:
     entry = ledger.get("4")
     assert entry is not None
     assert entry.original == "4"
+
+
+def test_one_client_many_agents_each_call_is_scored_and_reported_under_its_own_agent(api: ApiStub) -> None:
+    with Contextwaise(api_key=API_KEY, base_url=BASE_URL, agent="platform", max_tokens=60) as cw:
+        cw.note_intent("a", "Where is the auth middleware?")
+        result = cw.shrink(call_id="a", tool="list_files", output=LISTING, agent="Support bot")
+        cw.expand(result.ref, "feature 12")
+        cw.shrink(call_id="b", tool="echo", output="ok")
+    assert [b.get("agent") for b in api.score_bodies] == ["Support bot", "Support bot"]
+    results = [r for body in api.report_bodies for r in body["results"]]
+    assert [r.get("agent") for r in results] == ["Support bot", "Support bot", "platform"]
+
+
+def test_free_tokens_used_up_scoring_pauses_for_an_hour(
+    api: ApiStub, caplog: pytest.LogCaptureFixture, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    import time
+
+    api.quota_used_up = True
+    now = time.monotonic()
+    with (
+        caplog.at_level(logging.WARNING, "contextwaise"),
+        Contextwaise(api_key=API_KEY, base_url=BASE_URL, max_tokens=60) as cw,
+    ):
+        cw.shrink(call_id="a", tool="list_files", output=LISTING)
+        monkeypatch.setattr(time, "monotonic", lambda: now + 31)
+        b = cw.shrink(call_id="b", tool="list_files", output=LISTING)
+    assert len(api.score_bodies) == 1, "still paused after 31s"
+    assert b.reason == "api_unavailable"
+    assert "used up" in caplog.text

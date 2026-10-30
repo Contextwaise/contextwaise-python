@@ -41,7 +41,7 @@ from ._api import Api, ScoreRequest
 from ._ledger import BoundedDict, Ledger, LedgerEntry, MemoryLedger
 from ._relevance import word_overlap
 from ._shapers import is_error_line, sections, shape, tokens
-from ._types import Kind, Scorer, SectionLog, SectionReason, ShrinkResult
+from ._types import Kind, Reason, Scorer, SectionLog, SectionReason, ShrinkResult
 
 logger = logging.getLogger("contextwaise")
 
@@ -149,6 +149,7 @@ class BaseContextwaise:
                     "the http(s) address of your Contextwaise app."
                 )
             self._api = Api(api_key=api_key, base_url=base_url, agent=agent)
+        self._agent = agent
         self._max_tokens = max_tokens
         self._budgets = budgets
         self._full = frozenset(full)
@@ -184,6 +185,7 @@ class BaseContextwaise:
         integration: str = "python",
         model: str | None = None,
         full: bool = False,
+        agent: str | None = None,
     ) -> Steps[ShrinkResult]:
         ref = _ref(call_id)
         known = self._ledger.get(ref)
@@ -205,37 +207,56 @@ class BaseContextwaise:
             tokens_before=size,
             tokens_after=size,
             intent=intent,
+            reason="failed",
         )
+        agent = agent or self._agent
 
         try:
-            result = yield from self._view_steps(base, call_id, tool, original, min_saving, full)
+            result = yield from self._view_steps(base, call_id, tool, original, min_saving, full, agent)
         except Exception:  # a view must never cost the agent its result: the output passes as is
             logger.exception("shrink failed for %s (%s): output passed as is", call_id, tool)
             result = base
         if result.mode != "full" and result.tokens_after >= result.tokens_before:
             result = dataclasses.replace(
-                base, kind=result.kind, notes=("no smaller view possible: sent as is",)
+                base, kind=result.kind, reason=result.reason, notes=("no smaller view possible: sent as is",)
             )
 
-        self._ledger.set(ref, LedgerEntry(call_id=call_id, tool=tool, original=original, result=result))
+        self._ledger.set(
+            ref, LedgerEntry(call_id=call_id, tool=tool, original=original, result=result, agent=agent)
+        )
         ms = round((time.perf_counter() - started) * 1000)
         logger.debug(
             "shrink %s (%s): %s, %d → %d tokens", call_id, tool, result.mode, size, result.tokens_after
         )
         if self._api:
             self._api.report_result(
-                call_id=call_id, tool=tool, result=result, ms=ms, integration=integration, model=model
+                call_id=call_id,
+                tool=tool,
+                result=result,
+                ms=ms,
+                integration=integration,
+                model=model,
+                agent=agent,
             )
         return result
 
     def _view_steps(
-        self, base: ShrinkResult, call_id: str, tool: str, original: str, min_saving: float, full: bool
+        self,
+        base: ShrinkResult,
+        call_id: str,
+        tool: str,
+        original: str,
+        min_saving: float,
+        full: bool,
+        agent: str | None,
     ) -> Steps[ShrinkResult]:
         """The view, from cheapest to most involved: untouched, noise removed, relevant parts."""
         if full:
-            return dataclasses.replace(base, notes=("this call is set to pass whole",))
+            return dataclasses.replace(base, reason="marked_full", notes=("this call is set to pass whole",))
         if tool in self._full:
-            return dataclasses.replace(base, notes=(f'"{tool}" is set to always pass whole',))
+            return dataclasses.replace(
+                base, reason="marked_full", notes=(f'"{tool}" is set to always pass whole',)
+            )
 
         def worth_cutting(whole_tokens: int, cut_tokens: int) -> bool:
             saving = whole_tokens - cut_tokens
@@ -243,10 +264,14 @@ class BaseContextwaise:
 
         budget = self._budgets.get(tool, self._max_tokens)
         shaped = shape(original)
+        if shaped.kind == "json" and _is_schema(shaped.text):
+            return dataclasses.replace(
+                base, reason="schema", kind="json", notes=("a schema or list of actions: passed whole",)
+            )
 
-        def whole(notes: tuple[str, ...], scorer: Scorer = "none") -> ShrinkResult:
+        def whole(reason: Reason, notes: tuple[str, ...], scorer: Scorer = "none") -> ShrinkResult:
             if not notes:
-                return dataclasses.replace(base, kind=shaped.kind, scorer=scorer)
+                return dataclasses.replace(base, kind=shaped.kind, scorer=scorer, reason=reason)
             text = f"{shaped.text}\n[contextwaise: {'; '.join(notes)}. Everything else is shown in full.]"
             return dataclasses.replace(
                 base,
@@ -256,28 +281,32 @@ class BaseContextwaise:
                 tokens_after=tokens(text),
                 notes=notes,
                 scorer=scorer,
+                reason=reason,
             )
 
-        if tokens(shaped.text) <= budget or not worth_cutting(tokens(shaped.text), budget):
-            return whole(shaped.notes)  # nothing to score: the API isn't called
+        # Nothing to score when no cut would be worth it: the API isn't called.
+        if tokens(shaped.text) <= budget:
+            return whole("fits_budget", shaped.notes)
+        if not worth_cutting(tokens(shaped.text), budget):
+            return whole("small_saving", shaped.notes)
 
         units = sections(shaped)
-        scores = yield from self._score_steps(call_id, tool, base.intent, units)
+        scores = yield from self._score_steps(call_id, tool, base.intent, units, agent)
         # No relevance, no cut: a guessed cut would silently cost answers.
         if scores is None:
-            return whole(shaped.notes)
+            return whole("api_unavailable", shaped.notes)
         # Every part equally relevant (e.g. "all of Acme's orders"): any cut would be
         # arbitrary and the agent would have to expand it all back. Keep the cleaned
         # output whole when it stays within a few budgets.
         if max(scores) - min(scores) < 0.05 and tokens(shaped.text) <= budget * UNIFORM_KEEP_FACTOR:
-            return whole((*shaped.notes, "every part equally relevant: kept whole"), "jev")
+            return whole("uniform", (*shaped.notes, "every part equally relevant: kept whole"), "jev")
 
         picked = _pick(units, scores, budget, shaped.kind)
         kept = sum(log.kept for log in picked)
         # Nothing fits the budget (one part bigger than all of it): an empty view only sends the
         # model to expand, one more call resending the conversation. Send the output instead.
         if not kept:
-            return whole(shaped.notes, "jev")
+            return whole("no_fit", shaped.notes, "jev")
         footer = _footer(
             base.ref,
             base.tokens_before,
@@ -289,7 +318,7 @@ class BaseContextwaise:
         text = f"{_render(units, picked, shaped.kind)}\n{footer}"
         # Errors are kept over budget: the actual cut can be smaller than planned.
         if not worth_cutting(tokens(shaped.text), tokens(text)):
-            return whole(shaped.notes, "jev")
+            return whole("small_saving", shaped.notes, "jev")
         return dataclasses.replace(
             base,
             text=text,
@@ -299,6 +328,7 @@ class BaseContextwaise:
             notes=shaped.notes,
             sections=picked,
             scorer="jev",
+            reason="cut",
         )
 
     # ---- expand ----
@@ -313,7 +343,7 @@ class BaseContextwaise:
         if question and question.strip():
             # Each question is its own scoring decision, replayed by the API like any tool call.
             scores = yield from self._score_steps(
-                f"{entry.call_id}:x{_digest(question)}", entry.tool, question, units
+                f"{entry.call_id}:x{_digest(question)}", entry.tool, question, units, entry.agent
             )
         # Parts the model already has, in the view or from an earlier expand, are not sent again:
         # asked twice, expand returns the next most relevant parts, so a model that didn't get what
@@ -339,13 +369,19 @@ class BaseContextwaise:
         logger.debug("expand %s (%s): %d tokens", ref, question, tokens(text))
         if self._api:
             self._api.report_expand(
-                call_id=entry.call_id, tool=entry.tool, tokens=tokens(text), context_tokens=context_tokens
+                call_id=entry.call_id,
+                tool=entry.tool,
+                tokens=tokens(text),
+                context_tokens=context_tokens,
+                agent=entry.agent,
             )
         return text
 
     # ---- relevance ----
 
-    def _score_steps(self, call_id: str, tool: str, intent: str, units: list[str]) -> Steps[Scores]:
+    def _score_steps(
+        self, call_id: str, tool: str, intent: str, units: list[str], agent: str | None = None
+    ) -> Steps[Scores]:
         """Each unit's relevance (0 to 1) to ``intent``, judged by the API; None without it."""
         if self._api is None or not units or not intent.strip():
             return None
@@ -354,7 +390,9 @@ class BaseContextwaise:
         # 1,214-line log). Score consecutive groups instead, each line taking its
         # group's score; errors are still kept on their own.
         groups = _group_consecutive(units, MAX_REMOTE_SECTIONS)
-        scores = yield ScoreRequest(call_id, tool, intent, [_for_scoring(text, intent) for text, _ in groups])
+        scores = yield ScoreRequest(
+            call_id, tool, intent, [_for_scoring(text, intent) for text, _ in groups], agent
+        )
         if scores is None:
             logger.debug("no relevance for %s: cleaned output passed whole", call_id)
             return None
@@ -540,6 +578,35 @@ def _pick(
 
 
 _ERROR_KEY = re.compile(r"(?:errors?|exception|fault)\b", re.IGNORECASE | re.ASCII)
+
+
+def _is_schema(text: str) -> bool:
+    """A tool schema or a list of tools/actions to pick from (MCP ``tools/list``, OpenAI or
+    Anthropic tool definitions, a JSON Schema). The agent's next call must follow it exactly: cut,
+    it gets expanded back piece by piece, each expand one more model call resending the
+    conversation (seen: Notion's MCP action list, 36K tokens cut, then 5 expands, +345% tokens).
+    Looks a few levels deep and at the first items of arrays only: data rarely has these keys."""
+    try:
+        value = json.loads(text)
+    except ValueError:
+        return False
+
+    def looks(v: Any, depth: int) -> bool:
+        if depth > 3:
+            return False
+        if isinstance(v, list):
+            return any(looks(x, depth + 1) for x in v[:5])
+        if not isinstance(v, dict):
+            return False
+        if "$schema" in v or "inputSchema" in v or "input_schema" in v:
+            return True
+        if v.get("type") == "object" and isinstance(v.get("properties"), dict) and v["properties"]:
+            return True
+        if v.get("type") == "function" and isinstance(v.get("function"), dict):
+            return True
+        return any(looks(x, depth + 1) for x in v.values())
+
+    return looks(value, 0)
 
 
 def _is_error_unit(unit: str, kind: Kind) -> bool:

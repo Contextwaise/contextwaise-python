@@ -30,6 +30,7 @@ class Contextwaise(BaseContextwaise):
         integration: str = "python",
         model: str | None = None,
         full: bool = False,
+        agent: str | None = None,
     ) -> ShrinkResult:
         """The model's view of a tool result. Same ``call_id``, same view, always.
 
@@ -42,14 +43,17 @@ class Contextwaise(BaseContextwaise):
             integration: Which adapter called, shown on the dashboard. Adapters set it.
             model: The model id that will read the result (e.g. ``"claude-sonnet-4-5"``), shown
                 with the agent on the dashboard.
-            full: This call's output must reach the model whole (a tool's schema, a list of
-                actions to pick from), like the tools in the ``full`` option.
+            full: This call's output must reach the model whole (e.g. a file the agent will
+                edit), like the tools in the ``full`` option. Schemas and lists of actions are
+                detected and passed whole on their own.
+            agent: The agent this call belongs to, overriding the ``agent`` option. For apps
+                hosting many agents on one client.
 
         Returns:
             The view; send ``result.text`` to the model as the tool result.
         """
         return run_steps(
-            self._shrink_steps(call_id, tool, args, output, integration, model, full), self._score
+            self._shrink_steps(call_id, tool, args, output, integration, model, full, agent), self._score
         )
 
     def expand(self, ref: str, question: str | None = None, *, context_tokens: int | None = None) -> str:
@@ -105,13 +109,14 @@ class AsyncContextwaise(BaseContextwaise):
         integration: str = "python",
         model: str | None = None,
         full: bool = False,
+        agent: str | None = None,
     ) -> ShrinkResult:
         """The model's view of a tool result. Same ``call_id``, same view, always.
 
         See ``Contextwaise.shrink``.
         """
         return await arun_steps(
-            self._shrink_steps(call_id, tool, args, output, integration, model, full), self._score
+            self._shrink_steps(call_id, tool, args, output, integration, model, full, agent), self._score
         )
 
     async def expand(

@@ -66,15 +66,18 @@ class ContextwaiseAgent(ai.Agent):
         *,
         tools: Sequence[ai.AgentTool],
         full: Callable[[str, Any], bool] | None = None,
+        agent: str | None = None,
     ) -> None:
-        """``full``: calls whose output must reach the model whole, e.g. a tool listing its
-        actions or returning a schema the next call must follow exactly. Cut, the agent
-        expands it back piece by piece."""
+        """``full``: calls whose output must reach the model whole, e.g. a file the agent will
+        edit. Schemas and lists of actions are detected and passed whole on their own.
+        ``agent``: the agent these tools belong to, for apps hosting many agents on one client
+        (one ``ContextwaiseAgent`` per agent). Default: the client's."""
         # Tool call id → size of the step that asked for that expand, until it runs.
         self._step_tokens: dict[str, int] = {}
         super().__init__(tools=[*tools, _expand_tool(cw, self._step_tokens)])
         self._cw = cw
         self._full = full
+        self._agent = agent
 
     async def loop(self, context: ai.Context) -> AsyncGenerator[Any]:
         while context.keep_running():
@@ -115,6 +118,7 @@ class ContextwaiseAgent(ai.Agent):
             integration=INTEGRATION,
             model=model,
             full=self._full is not None and self._full(part.tool_name, args.get(part.tool_call_id)),
+            agent=self._agent,
         )
         part.set_model_input(view.text)
 

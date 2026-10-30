@@ -55,12 +55,14 @@ def _blocks(outcomes: list[ToolOutcome]) -> list[dict[str, Any]]:
 
 
 def tool_results(
-    cw: Contextwaise, response: Any, run: RunTool, *, request: str | None = None
+    cw: Contextwaise, response: Any, run: RunTool, *, request: str | None = None, agent: str | None = None
 ) -> list[dict[str, Any]]:
     """Runs the response's tool calls and returns their ``tool_result`` blocks, in order:
     each output shrunk, ``expand`` answered, failures marked ``is_error``. Empty when the
     model called no tool. ``request``: the user's request, which sharpens relevance."""
-    return _blocks(run_tool_calls(cw, _calls(response), run, request, "anthropic", _input_tokens(response)))
+    return _blocks(
+        run_tool_calls(cw, _calls(response), run, request, "anthropic", _input_tokens(response), agent=agent)
+    )
 
 
 async def atool_results(
@@ -69,10 +71,13 @@ async def atool_results(
     run: Callable[[str, Any], Any | Awaitable[Any]],
     *,
     request: str | None = None,
+    agent: str | None = None,
 ) -> list[dict[str, Any]]:
     """``tool_results`` for asyncio: the calls run concurrently; ``run`` may be async."""
     return _blocks(
-        await arun_tool_calls(cw, _calls(response), run, request, "anthropic", _input_tokens(response))
+        await arun_tool_calls(
+            cw, _calls(response), run, request, "anthropic", _input_tokens(response), agent=agent
+        )
     )
 
 

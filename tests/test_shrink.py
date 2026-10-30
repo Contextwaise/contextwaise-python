@@ -361,3 +361,51 @@ def test_records_in_a_list_are_judged_whole(api: ApiStub) -> None:
     assert view.mode == "trimmed"
     assert re.search(r"ORD-2041[\s\S]*Delivered damaged", view.text), "the record with its notes, whole"
     assert sum(s.kept for s in view.sections) == 1
+
+
+NOTION_PAGES = [
+    {
+        "id": f"page-{i}",
+        "properties": {"title": "Gitmore roadmap" if i == 42 else f"Meeting notes {i}", "status": "Done"},
+    }
+    for i in range(80)
+]
+
+
+def test_schemas_and_lists_of_actions_pass_whole_even_in_an_mcp_envelope(api: ApiStub) -> None:
+    actions = [
+        {
+            "name": f"notion-action-{i}",
+            "description": f"Does thing {i} in the workspace, with options",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "query": {"type": "string", "description": f"query for {i}"},
+                    "limit": {"type": "number"},
+                },
+                "required": ["query"],
+            },
+        }
+        for i in range(60)
+    ]
+    mcp = {"content": [{"type": "text", "text": json.dumps({"tools": actions})}]}
+    cw = Contextwaise(api_key=API_KEY, base_url=BASE_URL, max_tokens=200)
+    schema = cw.shrink(call_id="schema", tool="mcp_notion", args={}, output=mcp)
+    assert (schema.mode, schema.reason) == ("full", "schema")
+    assert "notion-action-59" in schema.text
+    data = cw.shrink(call_id="pages", tool="mcp_notion", args={"query": "gitmore"}, output=NOTION_PAGES)
+    assert (data.mode, data.reason) == ("trimmed", "cut"), "data with a `properties` field is still cut"
+
+
+def test_every_result_says_why_it_got_its_view(api: ApiStub) -> None:
+    cw = Contextwaise(api_key=API_KEY, base_url=BASE_URL, max_tokens=200, full=["read_file"])
+    reasons = [
+        cw.shrink(call_id="r1", tool="read_file", output=TEST_RUN).reason,
+        cw.shrink(call_id="r2", tool="echo", output="ok").reason,
+        cw.shrink(call_id="r3", tool="mcp_notion", args={"query": "gitmore"}, output=NOTION_PAGES).reason,
+    ]
+    assert reasons == ["marked_full", "fits_budget", "cut"]
+    offline = Contextwaise(max_tokens=200).shrink(
+        call_id="r4", tool="mcp_notion", args={"query": "gitmore"}, output=NOTION_PAGES
+    )
+    assert offline.reason == "api_unavailable"

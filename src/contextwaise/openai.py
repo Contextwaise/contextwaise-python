@@ -77,13 +77,16 @@ def tool_messages(
     run: RunTool,
     *,
     request: str | None = None,
+    agent: str | None = None,
     prompt_tokens: int | None = None,
 ) -> list[dict[str, Any]]:
     """Runs a Chat Completions message's tool calls and returns the ``tool`` messages to
     send back, in order: each output shrunk, ``expand`` answered, failures as "Error: …".
     ``prompt_tokens``: the completion's ``usage.prompt_tokens`` (a message doesn't carry
     it), so the dashboard can count what each expand cost."""
-    return _tool_messages(run_tool_calls(cw, _chat_calls(message), run, request, "openai", prompt_tokens))
+    return _tool_messages(
+        run_tool_calls(cw, _chat_calls(message), run, request, "openai", prompt_tokens, agent=agent)
+    )
 
 
 async def atool_messages(
@@ -92,11 +95,14 @@ async def atool_messages(
     run: _Run,
     *,
     request: str | None = None,
+    agent: str | None = None,
     prompt_tokens: int | None = None,
 ) -> list[dict[str, Any]]:
     """``tool_messages`` for asyncio: the calls run concurrently; ``run`` may be async."""
     calls = _chat_calls(message)
-    return _tool_messages(await arun_tool_calls(cw, calls, run, request, "openai", prompt_tokens))
+    return _tool_messages(
+        await arun_tool_calls(cw, calls, run, request, "openai", prompt_tokens, agent=agent)
+    )
 
 
 def _response_calls(response: Any) -> list[ToolCall]:
@@ -116,23 +122,25 @@ def _function_outputs(outcomes: list[ToolOutcome]) -> list[dict[str, Any]]:
 
 
 def function_outputs(
-    cw: Contextwaise, response: Any, run: RunTool, *, request: str | None = None
+    cw: Contextwaise, response: Any, run: RunTool, *, request: str | None = None, agent: str | None = None
 ) -> list[dict[str, Any]]:
     """Runs a Responses API response's function calls and returns the
     ``function_call_output`` items to send back, in order."""
     calls = _response_calls(response)
     return _function_outputs(
-        run_tool_calls(cw, calls, run, request, "openai", usage_tokens(response, "input_tokens"))
+        run_tool_calls(cw, calls, run, request, "openai", usage_tokens(response, "input_tokens"), agent=agent)
     )
 
 
 async def afunction_outputs(
-    cw: AsyncContextwaise, response: Any, run: _Run, *, request: str | None = None
+    cw: AsyncContextwaise, response: Any, run: _Run, *, request: str | None = None, agent: str | None = None
 ) -> list[dict[str, Any]]:
     """``function_outputs`` for asyncio: the calls run concurrently; ``run`` may be async."""
     calls = _response_calls(response)
     return _function_outputs(
-        await arun_tool_calls(cw, calls, run, request, "openai", usage_tokens(response, "input_tokens"))
+        await arun_tool_calls(
+            cw, calls, run, request, "openai", usage_tokens(response, "input_tokens"), agent=agent
+        )
     )
 
 
