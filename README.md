@@ -1,5 +1,7 @@
 # contextwaise
 
+[![PyPI](https://img.shields.io/pypi/v/contextwaise)](https://pypi.org/project/contextwaise/)
+
 Shrinks agent **tool results** before the model reads them: cache-safe, reversible, intent-aware.
 
 In an agent loop, every tool result is resent on every later turn. A 20K-token test log read at turn 3 of a 20-turn task is paid ~17 more times. Contextwaise gives the model a short view of each result, once, at the moment the tool returns:
@@ -165,7 +167,7 @@ uv run mypy
 uv build                # sdist + wheel in dist/
 ```
 
-The TypeScript SDK lives in [Contextwaise/contextwaise-typescript](https://github.com/Contextwaise/contextwaise-typescript), with the rules it shares with this package in its [`core`](https://github.com/Contextwaise/contextwaise-typescript/tree/main/core) (`shapers.ts`, `relevance.ts`). The two SDKs make the same decisions: a change to the shapers, relevance or the SDK core should land in both.
+The TypeScript SDK ([`contextwaise` on npm](https://www.npmjs.com/package/contextwaise)) lives in [Contextwaise/contextwaise-typescript](https://github.com/Contextwaise/contextwaise-typescript), with the rules it shares with this package in its [`core`](https://github.com/Contextwaise/contextwaise-typescript/tree/main/core) (`shapers.ts`, `relevance.ts`). The two SDKs make the same decisions: a change to the shapers, relevance or the SDK core should land in both.
 
 ## License
 
